@@ -5,6 +5,7 @@
 #   tail -f /var/log/omarchy-install.log /var/log/comfyui-install.log /var/log/resolve-install.log
 package_update: true
 locale: en_US.UTF-8
+timezone: America/New_York
 # Stock Arch cloud images have no swap; AUR builds (yay/davinci-resolve) and
 # large model loads can OOM without it. 4G is a cheap floor, not a tune.
 swap:
@@ -25,6 +26,16 @@ packages:
   - cuda
 
 write_files:
+  - path: /usr/local/sbin/tune-hardware
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      # Stock makepkg.conf builds AUR packages (yay, davinci-resolve) single-job.
+      # Use all cores instead.
+      sed -i "s/^#MAKEFLAGS=.*/MAKEFLAGS=\"-j$(nproc)\"/" /etc/makepkg.conf
+
   - path: /usr/local/sbin/install-omarchy
     permissions: "0755"
     owner: root:root
@@ -69,16 +80,19 @@ write_files:
         pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
         pip install -r requirements.txt
-        pip install "huggingface_hub[cli]"
+        pip install "huggingface_hub[cli]" hf_transfer
+        export HF_HUB_ENABLE_HF_TRANSFER=1
 
         mkdir -p models/diffusion_models/wan models/diffusion_models/hunyuan_video \
                  models/vae models/text_encoders models/clip_vision
 
-        # ~30GB and ~25GB respectively — this is the slow part of first boot.
+        # ~30GB and ~25GB — run concurrently and let hf_transfer saturate the
+        # link; 12 cores/128GB have room for both at once.
         huggingface-cli download Comfy-Org/Wan_2.1_ComfyUI_repackaged \
-          --local-dir models/diffusion_models/wan --include "*.safetensors"
+          --local-dir models/diffusion_models/wan --include "*.safetensors" &
         huggingface-cli download Comfy-Org/HunyuanVideo_repackaged \
-          --local-dir models/diffusion_models/hunyuan_video --include "*.safetensors"
+          --local-dir models/diffusion_models/hunyuan_video --include "*.safetensors" &
+        wait
       '
 
   - path: /etc/systemd/system/comfyui.service
@@ -94,7 +108,7 @@ write_files:
       Type=simple
       User=omarchy
       WorkingDirectory=/home/omarchy/ComfyUI
-      ExecStart=/home/omarchy/ComfyUI/venv/bin/python main.py --listen
+      ExecStart=/home/omarchy/ComfyUI/venv/bin/python main.py --listen --highvram
       Restart=on-failure
       RestartSec=5
 
@@ -125,10 +139,12 @@ write_files:
       '
 
 runcmd:
+  - bash /usr/local/sbin/tune-hardware
   - bash /usr/local/sbin/install-omarchy
   - bash /usr/local/sbin/install-comfyui
   - systemctl daemon-reload
   - systemctl enable comfyui.service
+  - systemctl enable nvidia-persistenced.service
   - bash /usr/local/sbin/install-resolve
 
 power_state:
