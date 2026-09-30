@@ -1,0 +1,129 @@
+#cloud-config
+# Vultr Cloud GPU: deploy an Arch Linux instance and paste this as the Cloud-Init user-data.
+# First boot: Omarchy -> NVIDIA/CUDA -> ComfyUI (+ Wan2.1 & HunyuanVideo weights) -> DaVinci Resolve -> reboot.
+# Watch progress:
+#   tail -f /var/log/omarchy-install.log /var/log/comfyui-install.log /var/log/resolve-install.log
+package_update: true
+packages:
+  - git
+  - curl
+  - sudo
+  - base-devel
+  - go
+  - ffmpeg
+  - python
+  - python-pip
+  - nvidia
+  - nvidia-utils
+  - cuda
+
+write_files:
+  - path: /usr/local/sbin/install-omarchy
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      exec > >(tee /var/log/omarchy-install.log) 2>&1
+
+      # Omarchy's installer refuses root; make a sudo user.
+      if ! id omarchy &>/dev/null; then
+        useradd -m -G wheel -s /bin/bash omarchy
+        echo 'omarchy ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/omarchy
+        mkdir -p /home/omarchy/.ssh
+        # Vultr puts your deploy-time SSH key on root's account
+        [[ -f /root/.ssh/authorized_keys ]] && cp /root/.ssh/authorized_keys /home/omarchy/.ssh/
+        chown -R omarchy:omarchy /home/omarchy/.ssh
+      fi
+
+      # Cloud GPU passthrough should give us /dev/dri; fall back to headless if it doesn't.
+      wlr=()
+      if ! ls /dev/dri/* &>/dev/null; then
+        wlr=(WLR_BACKENDS=headless WLR_LIBINPUT_NO_DEVICES=1)
+      fi
+
+      sudo -u omarchy -i env "${wlr[@]}" bash -c 'curl -fsSL https://omarchy.org/install | bash'
+
+  - path: /usr/local/sbin/install-comfyui
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      exec > >(tee /var/log/comfyui-install.log) 2>&1
+
+      sudo -u omarchy -i bash -c '
+        set -euo pipefail
+        cd ~
+        git clone --depth 1 https://github.com/comfyanonymous/ComfyUI
+        cd ComfyUI
+        python -m venv venv
+        source venv/bin/activate
+        pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+        pip install -r requirements.txt
+        pip install "huggingface_hub[cli]"
+
+        mkdir -p models/diffusion_models/wan models/diffusion_models/hunyuan_video \
+                 models/vae models/text_encoders models/clip_vision
+
+        # ~30GB and ~25GB respectively — this is the slow part of first boot.
+        huggingface-cli download Comfy-Org/Wan_2.1_ComfyUI_repackaged \
+          --local-dir models/diffusion_models/wan --include "*.safetensors"
+        huggingface-cli download Comfy-Org/HunyuanVideo_repackaged \
+          --local-dir models/diffusion_models/hunyuan_video --include "*.safetensors"
+      '
+
+  - path: /etc/systemd/system/comfyui.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=ComfyUI
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      User=omarchy
+      WorkingDirectory=/home/omarchy/ComfyUI
+      ExecStart=/home/omarchy/ComfyUI/venv/bin/python main.py --listen
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /usr/local/sbin/install-resolve
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      exec > >(tee /var/log/resolve-install.log) 2>&1
+
+      sudo -u omarchy -i bash -c '
+        set -euo pipefail
+        cd ~
+        git clone https://aur.archlinux.org/yay.git
+        cd yay && makepkg -si --noconfirm
+        cd ~
+        # ponytail: Blackmagic gates the Resolve installer behind an account + EULA
+        # web form, no direct download URL exists, so this AUR build cannot fetch
+        # it unattended. Upgrade path: download the Linux zip from
+        # blackmagicdesign.com/support/download/ manually and drop it in
+        # ~/.cache/yay/davinci-resolve/ before re-running, then this succeeds.
+        yay -S --noconfirm davinci-resolve || \
+          echo "davinci-resolve: place the Blackmagic-downloaded zip in ~/.cache/yay/davinci-resolve/ and re-run: yay -S davinci-resolve"
+      '
+
+runcmd:
+  - bash /usr/local/sbin/install-omarchy
+  - bash /usr/local/sbin/install-comfyui
+  - systemctl daemon-reload
+  - systemctl enable comfyui.service
+  - bash /usr/local/sbin/install-resolve
+
+power_state:
+  mode: reboot
+  timeout: 3600
