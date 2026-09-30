@@ -4,6 +4,13 @@
 # Watch progress:
 #   tail -f /var/log/omarchy-install.log /var/log/comfyui-install.log /var/log/resolve-install.log
 package_update: true
+locale: en_US.UTF-8
+# Stock Arch cloud images have no swap; AUR builds (yay/davinci-resolve) and
+# large model loads can OOM without it. 4G is a cheap floor, not a tune.
+swap:
+  filename: /swapfile
+  size: "4G"
+  maxsize: "4G"
 packages:
   - git
   - curl
